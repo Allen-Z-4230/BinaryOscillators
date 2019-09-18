@@ -1,38 +1,46 @@
-# coding: utf-8
 import numpy as np
 import scipy as sp
 from matplotlib import pyplot as plt
 from numpy import around as ar
+from operator import itemgetter as ig
 import simpy
 
-class Race:
-    def __init__(self, env, length,*animals):
-        """Constructor
 
+class Race:
+    def __init__(self, env, length, *animals):
+        """
         env: simpy Environment
         length: float, length of the racetrack
         *animals: list of animals in the race
         """
-        pass
+        self.env = env
+        self.len = length
+        [setattr(animal, 'race', self) for animal in animals]
+        self.animals = animals
+        self.results = []
+        self.race_proc = env.process(self.race())
 
-    def run(env, name, v0, a = 0):
-        """Animal simulation for tortoise and hare
-        env: simpy simulation environment
-        name: name of the animal
-        speed: speed of the animal (m/s)
+    def race(self):
+        """Racing generator function, takes a list of animal processes and waits
+        for the 'finished' event to trigger before ending simulation & printing
+        results
         """
-        a = [env.process(animal.run()) for animal in animals]
-        while True:
-            t = env.now
-            v = v0 + a*t
-            #FIXME: need to be distance-based
-            print('The ' + name, 'traveled', v*t, 'meters')
-            yield env.timeout(1)
+        events = [animal.finished for animal in self.animals]
+        all_finished = simpy.events.AllOf(self.env, events)
+        yield all_finished
+        print("All animals finished the race !")
+        self.print_results()
 
-
-
-#When do they catch up to each other?
-#Make it so that the simulation stops when racetrack ends
+    def print_results(self, plots = True):
+        ss = Animal.step_size
+        self.results = [((animal.name), len(animal.dhist)) for animal in self.animals]
+        sorted_res = sorted(self.results, key=ig(1))
+        print("-----------------------------")
+        print("Ranks:")
+        for ind, (name, time) in enumerate(sorted_res):
+            print("{} place: {}, {}s".format(ind + 1, name, time*ss))
+        if plots:
+            [animal.plot() for animal in self.animals]
 
 class Animal:
     #TODO: Deep learning for stamina/speed optimization
@@ -43,8 +51,10 @@ class Animal:
     v0 = 0
     step_size = .001 # 1 is 1 second
 
-    def __init__(self, env, name, top_speed, base_acc,
-                 base_stamina, regen_rate, tactic = 'sprint-rest'):
+    def __init__(self, env, name, top_speed,
+                 base_acc, base_stamina, regen_rate,
+                 race = None, tactic = 'sprint-rest'):
+        self.race = race #for participating in races
         self.tactic = tactic #sprint-walk or sprint-rest
         #Animal base stats
         self.name = name
@@ -65,31 +75,33 @@ class Animal:
         self.shist = []
         #SimPy environment & processes
         self.env = env
-        self.move_proc = env.process(self.move())
+        self.move_proc = env.process(self.move()) #main movement process
+        self.finished = self.env.event() #marker for finishing the race
 
-    def move(self):
-        """racing cycle"""
-        if self.tactic == 'sprint-walk':
-            while True:
-                self.cycle += 1
-                sprint = self.env.process(self.sprint())
-                yield sprint
-                walk = self.env.process(self.walk())
-                yield walk
-        elif self.tactic == 'sprint-rest':
-            while True:
-                self.cycle += 1
-                sprint = self.env.process(self.sprint())
-                yield sprint
-                rest = self.env.process(self.rest())
-                yield rest
+    def move(self): #FIXME: environment times and process ordering is f-ed up
+        """sprint-walk or sprint-rest cycles ad infinitum, only stops if
+        interrupted by the 'finished' event.
+        """
+        try:
+            if self.tactic == 'sprint-walk':
+                while True:
+                    self.cycle += 1
+                    yield self.env.process(self.sprint())
+                    yield self.env.process(self.walk())
+            elif self.tactic == 'sprint-rest':
+                while True:
+                    self.cycle += 1
+                    yield self.env.process(self.sprint())
+                    yield self.env.process(self.rest())
+        except simpy.Interrupt:
+            pass
 
     def sprint(self):
         """While the animals still has stamina, it continues to accelerate until
         it reaches its top speed. After 70% of the stamina has been depleted
         the animal starts to decelerate.
         """
-        print("{} starts running at {}".format(self.name, self.env.now))
+        print("{} starts sprinting at {}".format(self.name, self.env.now))
         while self.stamina > 0:
             #stamina calculated from current speed
             speed_ratio = self.speed/self.top_speed
@@ -109,10 +121,14 @@ class Animal:
             self.dist += self.speed*Animal.step_size
             self.store_data()
 
-            yield self.env.timeout(Animal.step_size)
-        return self.dist
+            if self.race:
+                if self.dist >= self.race.len:
+                    self.stop()
+                    break
+            else:
+                yield self.env.timeout(Animal.step_size)
 
-    def rest(self, percent_recov = .5):
+    def rest(self, percent_recov = 1):
         """Animal stops moving to recover stamina.
         percent_recov: 0-1, percent of stamina the animal chooses to recover
         """
@@ -131,8 +147,19 @@ class Animal:
         print("{} starts walking at {}".format(self.name, self.env.now))
         while self.stamina < (self.base_stamina*percent_recov):
             self.stamina += (self.regen_rate*Animal.step_size)/2
-            self.store_data()
-            yield self.env.timeout(Animal.step_size)
+            self.dist += self.speed*Animal.step_size
+            if self.race:
+                if self.dist >= self.race.len:
+                    self.stop()
+                    break
+            else:
+                yield self.env.timeout(Animal.step_size)
+
+    def stop(self):
+        """Animal finishes race when it reaches the given distance"""
+        print('{} has finished the race at {}!'.format(self.name, self.env.now))
+        self.move_proc.interrupt('finished')
+        self.finished.succeed()
 
     def store_data(self):
         """Stores information in lists"""
@@ -159,8 +186,8 @@ class Animal:
         axs[2].legend(loc = 'lower left')
         #plt.xlabel(unit)
 
-        rtext = "Results: {} sprint-rest cycles, distance: {} m, average speed: {} m/s"
-        results = rtext.format(self.cycle, ar(self.dhist[-1], 2),
+        rtext = "Results: {} {} cycles, distance: {} m, average speed: {} m/s"
+        results = rtext.format(self.cycle, self.tactic, ar(self.dhist[-1], 2),
                                ar(np.mean(self.vhist), 2))
         fig.text(0.5, 0.02, results, ha = 'center', va = 'bottom')
         plt.show()
@@ -181,14 +208,12 @@ class Animal:
 def main():
     #peter_parker = Animal('Peter Parker', 70, 10, 1000, 500)
     env = simpy.Environment()
-    cow = Animal(env, 'cow', 11.18, 2, 200, 10, tactic = 'sprint-walk')
-    #jaguar = Animal(env, 'jaguar', 33.5, 9, 50, 5)
-    env.run(until=200)
-
-    # for i in range(2):
-    #     cow.move()
-    #jaguar.plot()
-    cow.plot()
+    cow = Animal(env, 'cow', 11.18, 2, 200, 10, tactic = 'sprint-rest')
+    cheetah = Animal(env, 'cheetah', 33.5, 9, 50, 5, tactic = 'sprint-rest')
+    gazzelle = Animal(env, 'gazzelle', 25, 8, 150, 10)
+    runners = [cow, cheetah, gazzelle]
+    race = Race(env, 1000, *runners)
+    env.run()
 
 if __name__ == '__main__':
     main()
